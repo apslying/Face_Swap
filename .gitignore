@@ -1,4 +1,6 @@
 *.jpg
 *.txt
 *.dat
+*.mp4
+*.pyc
 /TestSet_P2/

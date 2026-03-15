@@ -3,6 +3,7 @@ import dlib
 import numpy as np
 import random
 from scipy.interpolate import RegularGridInterpolator
+from smooth import LandmarkSmoother
 
 
 # 1. Load the detector and predictor
@@ -44,57 +45,41 @@ def get_landmarks(image):
 
 # cap.release()
 
-
-def draw_delaunay(img, subdiv, color):
-    # 1. Get the list of triangles
-    # Each triangle is stored as [x1, y1, x2, y2, x3, y3]
-    triangles = subdiv.getTriangleList()
+# --- Delaunay Triangulation ---
+def get_delaunay_triangles(rect, points):
+    """
+    Calculates Delaunay triangles for a given set of points within a rectangle.
+    Returns a list of triangles, where each triangle is a list of 3 (x, y) tuples.
+    """
+    subdiv = cv2.Subdiv2D(rect)
     
-    h, w = img.shape[:2]
-    rect = (0, 0, w, h)
+    # Insert points into subdiv
+    for p in points:
+        subdiv.insert((int(p[0]), int(p[1])))
 
-    for t in triangles:
-        pt1 = (int(t[0]), int(t[1]))
-        pt2 = (int(t[2]), int(t[3]))
-        pt3 = (int(t[4]), int(t[5]))
+    triangle_list = subdiv.getTriangleList()
+    delaunay_triangles = []
 
-        # 2. Check if the points are inside the image boundary
-        # getTriangleList can return points outside the initial rect
-        if rect_contains(rect, pt1) and rect_contains(rect, pt2) and rect_contains(rect, pt3):
-            cv2.line(img, pt1, pt2, color, 1, cv2.LINE_AA, 0)
-            cv2.line(img, pt2, pt3, color, 1, cv2.LINE_AA, 0)
-            cv2.line(img, pt3, pt1, color, 1, cv2.LINE_AA, 0)
+    for t in triangle_list:
+        # Convert triangle array [x1, y1, x2, y2, x3, y3] into 3 points
+        pts = [
+            (int(t[0]), int(t[1])),
+            (int(t[2]), int(t[3])),
+            (int(t[4]), int(t[5]))
+        ]
 
-def rect_contains(rect, point):
-    """Checks if a point is inside a rectangle."""
-    return rect[0] <= point[0] < rect[2] and rect[1] <= point[1] < rect[3]
-
-# --- Main Implementation ---
-
-# Create a blank image
-img = np.zeros((600, 600, 3), dtype=np.uint8)
-rect = (0, 0, 600, 600)
-
-# Initialize Subdiv2D with the bounding rectangle
-subdiv = cv2.Subdiv2D(rect)
-
-# Generate some random points or use your own
-points = []
-for i in range(25):
-    points.append((random.randint(50, 550), random.randint(50, 550)))
-
-# Insert points into subdiv
-for p in points:
-    subdiv.insert(p)
-    # Optional: Draw points
-    cv2.circle(img, p, 3, (0, 0, 255), -1)
-
-# Retrieve and draw the triangles
-draw_delaunay(img, subdiv, (255, 255, 255))
-
-cv2.imshow("Delaunay Triangulation", img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+        # Only include triangles where all vertices are within the image boundaries
+        # Subdiv2D uses large 'dummy' points outside the rect which we must filter
+        is_inside = True
+        for p in pts:
+            if not (rect[0] <= p[0] < rect[2] and rect[1] <= p[1] < rect[3]):
+                is_inside = False
+                break
+        
+        if is_inside:
+            delaunay_triangles.append(pts)
+            
+    return delaunay_triangles
 
 # --- Morphing ---
 
@@ -206,69 +191,219 @@ def get_triangle_indices(points, triangle_list):
         indices.append(tri_indices)
     return indices
 
-def main():
-    img_path = "C:/Users/hengyiwu/Desktop/Research/vision_robotics/Face_Swap/Rambo.jpg"
-    out_path = "C:/Users/hengyiwu/Desktop/Research/vision_robotics/Face_Swap/Rambo_landmarks.txt"
-    save_path = "C:/Users/hengyiwu/Desktop/Research/vision_robotics/Face_Swap/Rambo_with_triangles.jpg"
-    img = cv2.imread(img_path)
-    size = img.shape
-    rect = (0, 0, size[1], size[0])
-    landmarks = get_landmarks(img)
-    # print(landmarks)
-    # 1. Draw the landmarks on the image
-    for (x, y) in landmarks:
-        # cv2.circle(image, center_coordinates, radius, color, thickness)
-        # Color is BGR, so (0, 0, 255) is Bright Red
-        cv2.circle(img, (int(x), int(y)), 2, (0, 0, 255), -1)
+def replace_face(original_img, morphed_face_img):
+    """
+    Replaces the face in original_img with the face from morphed_face_img.
+    Assumes morphed_face_img has the face in the correct position with a black background.
+    """
+    # 1. Create a grayscale version of the morphed image
+    gray_morphed = cv2.cvtColor(morphed_face_img, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Create a binary mask where the face is (anything not black)
+    # Threshold 1 means anything above 'almost black' becomes white (255)
+    _, mask = cv2.threshold(gray_morphed, 1, 255, cv2.THRESH_BINARY)
+    
+    # 3. Create the inverse mask (white everywhere EXCEPT the face)
+    mask_inv = cv2.bitwise_not(mask)
+    
+    # 4. Black out the face area in the original image using the inverse mask
+    # This 'clears the stage' for the new face
+    bg = cv2.bitwise_and(original_img, original_img, mask=mask_inv)
+    
+    # 5. Extract only the face from the morphed image (it's already cropped, 
+    # but this ensures we don't pick up any noise)
+    fg = cv2.bitwise_and(morphed_face_img, morphed_face_img, mask=mask)
+    
+    # 6. Add the two images together
+    combined = cv2.add(bg, fg)
+    
+    return combined
 
-    with open(out_path, "w") as f:
-        for landmark in landmarks:
-            f.write(f"{landmark[0]} {landmark[1]}\n")
+def replace_face_seamless(original_img, morphed_face_img, landmarks):
+    """
+    Blends the morphed face into the original image using Poisson cloning.
+    'landmarks' should be the list of (x,y) points for the destination face.
+    """
+    # 1. Ensure dimensions match
+    h, w = original_img.shape[:2]
+    morphed_face_img = cv2.resize(morphed_face_img, (w, h))
 
-    # --- Delaunay Triangulation ---
-    # 1. Initialize Subdiv2D
+    # 2. Create the mask (the area to be cloned)
+    gray_morphed = cv2.cvtColor(morphed_face_img, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray_morphed, 1, 255, cv2.THRESH_BINARY)
+
+    # 3. Calculate the center of the face for cloning
+    # We find the bounding box of the landmarks to find the true face center
+    convexhull = cv2.convexHull(np.array(landmarks, dtype=np.int32))
+    x, y, w_face, h_face = cv2.boundingRect(convexhull)
+    center = (x + w_face // 2, y + h_face // 2)
+
+    # 4. Perform Seamless Cloning
+    # cv2.NORMAL_CLONE: Keeps the lighting of the destination image
+    # cv2.MIXED_CLONE: Blends textures (better if there are glasses or hair)
+    output = cv2.seamlessClone(morphed_face_img, original_img, mask, center, cv2.NORMAL_CLONE)
+
+    return output
+
+def process_video(source_img_path, target_video_path, output_path):
+    # 1. Initialize detector/predictor
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+    # 2. Prepare Source Image (The face to be swapped IN)
+    img_a = cv2.imread(source_img_path)
+    points_a = get_landmarks(img_a) 
+    if points_a is None:
+        print("Could not find a face in the source image.")
+        return
+
+    # 3. Calculate Delaunay Triangulation ONCE based on source face
+    rect = (0, 0, img_a.shape[1], img_a.shape[0])
     subdiv = cv2.Subdiv2D(rect)
-
-    # 2. Insert points into subdiv
-    for p in landmarks:
+    for p in points_a:
         subdiv.insert((int(p[0]), int(p[1])))
+    triangle_indices = get_triangle_indices(points_a, subdiv.getTriangleList())
 
-    # 3. Get the list of triangles
-    # Each triangle is returned as a list of 6 numbers: [x1, y1, x2, y2, x3, y3]
-    triangle_list = subdiv.getTriangleList()
+    # 4. Initialize Video Capture and Writer
+    cap = cv2.VideoCapture(target_video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # --- Draw Triangles and Dots ---
-    for t in triangle_list:
-        # Extract coordinates for the 3 vertices
-        pts = [
-            (int(t[0]), int(t[1])),
-            (int(t[2]), int(t[3])),
-            (int(t[4]), int(t[5]))
-        ]
+    print("Processing video frames...")
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Get landmarks for the person in the current video frame
+        points_b = get_landmarks(frame)
+
+        if points_b is not None:
+            # Warp source face (img_a) to target face shape (frame)
+            warped_face = perform_morph(img_a, frame, points_a, points_b, triangle_indices)
+            
+            # Blend the warped face into the video frame
+            frame = replace_face_seamless(frame, warped_face, points_b)
+
+        out.write(frame)
         
-        # Check if the triangle vertices are within the image boundaries
-        # (Subdiv2D sometimes creates triangles using "virtual" outer points)
-        is_inside = True
-        for p in pts:
-            if not (0 <= p[0] < size[1] and 0 <= p[1] < size[0]):
-                is_inside = False
-                break
-                
-        if is_inside:
-            # Draw the triangle edges (Green)
-            cv2.line(img, pts[0], pts[1], (0, 255, 0), 1, cv2.LINE_AA)
-            cv2.line(img, pts[1], pts[2], (0, 255, 0), 1, cv2.LINE_AA)
-            cv2.line(img, pts[2], pts[0], (0, 255, 0), 1, cv2.LINE_AA)
+        # Optional: Show the video while processing
+        cv2.imshow("Face Swap in Progress", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    # Draw the landmarks as red dots on top
-    for p in landmarks:
-        cv2.circle(img, (int(p[0]), int(p[1])), 2, (0, 0, 255), -1)
-    # 3. Save the new image
-
-    cv2.imwrite(save_path, img)
-    cv2.imshow("Image", img)
-    cv2.waitKey(0)
+    cap.release()
+    out.release()
     cv2.destroyAllWindows()
+    print(f"Video saved to {output_path}")
+
+def process_video_smoothed(source_img_path, target_video_path, output_path):
+    # 1. Initialize detector/predictor
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+    # 2. Prepare Source Image (Static)
+    img_a = cv2.imread(source_img_path)
+    points_a = get_landmarks(img_a) 
+    if points_a is None:
+        print("Error: No face found in source image.")
+        return
+
+    # Calculate Delaunay once for the source
+    rect = (0, 0, img_a.shape[1], img_a.shape[0])
+    subdiv = cv2.Subdiv2D(rect)
+    for p in points_a:
+        subdiv.insert((int(p[0]), int(p[1])))
+    triangle_indices = get_triangle_indices(points_a, subdiv.getTriangleList())
+
+    # 3. Setup Video Input/Output
+    cap = cv2.VideoCapture(target_video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # 4. Initialize the Smoother from smooth.py
+    # This stays OUTSIDE the loop to maintain state
+    kalman_smoother = LandmarkSmoother(num_landmarks=68)
+
+    print("Processing video frames with Kalman smoothing...")
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Detect raw landmarks in current frame
+        raw_points_b = get_landmarks(frame)
+
+        if raw_points_b is not None:
+            # APPLY SMOOTHING HERE
+            # We pass raw detections to Kalman; it returns smoothed coordinates
+            points_b = kalman_smoother.update(raw_points_b)
+            
+            # Warp and Swap
+            warped_face = perform_morph(img_a, frame, points_a, points_b, triangle_indices)
+            frame = replace_face_seamless(frame, warped_face, points_b)
+
+        out.write(frame)
+        
+        # Show progress
+        cv2.imshow("Smoothed Face Swap", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    print("Done!")
+
+def main():
+    # Load Images
+    img_a = cv2.imread("./Scarlett.jpg")
+    img_b = cv2.imread("./Rambo.jpg")
+    
+    # Get Landmarks (Assuming you have this function defined)
+    # Both must have the SAME number of points (e.g., 68 from dlib)
+    points_a = get_landmarks(img_a) 
+    points_b = get_landmarks(img_b)
+
+    # Calculate Delaunay Triangulation for Image A
+    size_a = img_a.shape
+    rect = (0, 0, size_a[1], size_a[0])
+    subdiv = cv2.Subdiv2D(rect)
+    
+    for p in points_a:
+        subdiv.insert((int(p[0]), int(p[1])))
+    
+    # This gives us raw coordinates [[x1, y1, x2, y2, x3, y3], ...]
+    raw_triangles = subdiv.getTriangleList()
+    
+    # Convert coordinates to indices [ [index1, index2, index3], ... ]
+    # We do this once so we can use the same connectivity for both faces
+    triangle_indices = get_triangle_indices(points_a, raw_triangles)
+
+    # Perform the Morph! 
+    # This warps Image A into the shape of Image B
+    warped_image = perform_morph(img_a, img_b, points_a, points_b, triangle_indices)
+
+    # Save 
+    cv2.imwrite("Morphed_Result.jpg", warped_image)
+
+    img_orig = cv2.imread("./Rambo.jpg")
+    img_morphed = cv2.imread("./Morphed_Result.jpg")
+    final_result = replace_face(img_orig, img_morphed)
+    final_result_seamless = replace_face_seamless(img_orig, img_morphed, points_b)
+    cv2.imwrite("Final_Face_Swap.jpg", final_result)
+    cv2.imwrite("Final_Face_Swap_Seamless.jpg", final_result_seamless)
 
 if __name__ == "__main__":
     main()
+    # process_video("./Scarlett.jpg", "./Test1.mp4", "./Output1.mp4")
+    process_video_smoothed("./Scarlett.jpg", "./Test1.mp4", "./Output1_smoothed.mp4")
