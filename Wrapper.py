@@ -7,21 +7,22 @@ from smooth import LandmarkSmoother
 
 
 # 1. Load the detector and predictor
-detector = dlib.get_frontal_face_detector()
+cnn_detector = dlib.cnn_face_detection_model_v1("mmod_human_face_detector.dat")
 predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
 def get_landmarks(image):
-    # dlib works best on grayscale images
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Detect faces in the image
-    faces = detector(gray)
+    # CNN detector returns a 'mmod_rectangles' object
+    faces = cnn_detector(gray, 1)
     
     for face in faces:
-        # Predict landmarks for the detected face region
-        landmarks = predictor(gray, face)
+        # The actual rectangle is stored in the 'rect' attribute of the mmod_rectangle
+        dlib_rect = face.rect
         
-        # Convert landmarks to a simple numpy array of (x, y) coordinates
+        # Predict landmarks using the same predictor
+        landmarks = predictor(gray, dlib_rect)
+        
         points = []
         for n in range(0, 68):
             x = landmarks.part(n).x
@@ -30,20 +31,6 @@ def get_landmarks(image):
             
         return np.array(points)
     return None
-
-# # --- FOR A VIDEO (.mp4) ---
-# cap = cv2.VideoCapture('video.mp4')
-# while cap.isOpened():
-#     ret, frame = cap.read()
-#     if not ret: break
-    
-#     landmarks = get_landmarks(frame)
-#     if landmarks is not None:
-#         # Now Person A can use these for Triangulation 
-#         # and Person B can use them for TPS!
-#         pass 
-
-# cap.release()
 
 # --- Delaunay Triangulation ---
 def get_delaunay_triangles(rect, points):
@@ -92,62 +79,31 @@ def get_barycentric_matrix(pts):
     ])
 
 def morph_triangle(img_src, img_dest, tri_src, tri_dest):
-    """Warps a single triangle from src to dest using Barycentric coordinates."""
-    
-    # Get bounding box of the destination triangle to limit computation
-    bbox = cv2.boundingRect(np.float32([tri_dest]))
-    x_range = np.arange(bbox[0], bbox[0] + bbox[2])
-    y_range = np.arange(bbox[1], bbox[1] + bbox[3])
-    
-    # Create a grid of points (x, y) within the bounding box
-    xv, yv = np.meshgrid(x_range, y_range)
-    pixel_coords = np.vstack([xv.ravel(), yv.ravel(), np.ones(xv.size)])
+    # 1. Get bounding boxes
+    r1 = cv2.boundingRect(np.float32([tri_src]))
+    r2 = cv2.boundingRect(np.float32([tri_dest]))
 
-    # Step 1: Compute Barycentric coordinates (alpha, beta, gamma)
-    # B_inv * [x, y, 1]^T = [alpha, beta, gamma]^T
-    B_mat = get_barycentric_matrix(tri_dest)
-    try:
-        B_inv = np.linalg.inv(B_mat)
-    except np.linalg.LinAlgError:
-        return # Skip degenerate triangles
+    # 2. Offset triangles by the bounding box top-left corner
+    tri1_cropped = []
+    tri2_cropped = []
+    for i in range(3):
+        tri1_cropped.append(((tri_src[i][0] - r1[0]), (tri_src[i][1] - r1[1])))
+        tri2_cropped.append(((tri_dest[i][0] - r2[0]), (tri_dest[i][1] - r2[1])))
 
-    bary_coords = B_inv @ pixel_coords
+    # 3. Create a mask for the triangle
+    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+    cv2.fillConvexPoly(mask, np.int32(tri2_cropped), (1.0, 1.0, 1.0), 16, 0)
+
+    # 4. Apply Affine Transform
+    img1_cropped = img_src[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
     
-    # Check if point is inside triangle: alpha, beta, gamma >= 0 and sum approx 1
-    # We use a small epsilon for floating point stability
-    eps = 1e-5
-    is_inside = np.all(bary_coords >= -eps, axis=0) & (np.sum(bary_coords, axis=0) <= 1 + eps)
-    
-    if not np.any(is_inside):
-        return
+    warp_mat = cv2.getAffineTransform(np.float32(tri1_cropped), np.float32(tri2_cropped))
+    img2_cropped = cv2.warpAffine(img1_cropped, warp_mat, (r2[2], r2[3]), None, 
+                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
-    # Filter only pixels inside the triangle
-    valid_bary = bary_coords[:, is_inside]
-    dest_pixels_x = xv.ravel()[is_inside]
-    dest_pixels_y = yv.ravel()[is_inside]
-
-    # Step 2: Compute corresponding positions in Source Image A
-    A_mat = get_barycentric_matrix(tri_src)
-    src_coords = A_mat @ valid_bary
-    
-    # Convert from homogeneous (not strictly necessary here as z=1, but following instructions)
-    src_x = src_coords[0, :] / src_coords[2, :]
-    src_y = src_coords[1, :] / src_coords[2, :]
-
-    # Step 3: Interpolate and Copy
-    # We setup interpolators for each color channel
-    h, w = img_src.shape[:2]
-    # RegularGridInterpolator expects (y_coords, x_coords)
-    fn_r = RegularGridInterpolator((np.arange(h), np.arange(w)), img_src[:,:,0], bounds_error=False, fill_value=0)
-    fn_g = RegularGridInterpolator((np.arange(h), np.arange(w)), img_src[:,:,1], bounds_error=False, fill_value=0)
-    fn_b = RegularGridInterpolator((np.arange(h), np.arange(w)), img_src[:,:,2], bounds_error=False, fill_value=0)
-
-    # Note: src_y is 'row', src_x is 'col'
-    query_pts = np.stack([src_y, src_x], axis=-1)
-    
-    img_dest[dest_pixels_y, dest_pixels_x, 0] = fn_r(query_pts)
-    img_dest[dest_pixels_y, dest_pixels_x, 1] = fn_g(query_pts)
-    img_dest[dest_pixels_y, dest_pixels_x, 2] = fn_b(query_pts)
+    # 5. Paste the warped triangle into the destination image
+    img_dest[r2[1]:r2[1] + r2[3], r2[0]:r2[0] + r2[2]] = \
+        img_dest[r2[1]:r2[1] + r2[3], r2[0]:r2[0] + r2[2]] * (1 - mask) + img2_cropped * mask
 
 def perform_morph(img_a, img_b, points_a, points_b, triangles):
     """
@@ -329,33 +285,57 @@ def process_video_smoothed(source_img_path, target_video_path, output_path):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # 4. Initialize the Smoother from smooth.py
-    # This stays OUTSIDE the loop to maintain state
+    # 4. Initialize the Smoother
     kalman_smoother = LandmarkSmoother(num_landmarks=68)
 
-    print("Processing video frames with Kalman smoothing...")
+    print("Processing video frames with Kalman smoothing and diagnostics...")
     
+    frame_count = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Detect raw landmarks in current frame
+        
+        frame_count += 1
         raw_points_b = get_landmarks(frame)
 
-        if raw_points_b is not None:
-            # APPLY SMOOTHING HERE
-            # We pass raw detections to Kalman; it returns smoothed coordinates
-            points_b = kalman_smoother.update(raw_points_b)
-            
-            # Warp and Swap
-            warped_face = perform_morph(img_a, frame, points_a, points_b, triangle_indices)
-            frame = replace_face_seamless(frame, warped_face, points_b)
+        # --- DIAGNOSTIC 1: Did dlib fail to find a face? ---
+        if raw_points_b is None:
+            print(f"Skipped Frame {frame_count}: No face detected by dlib.")
+            cv2.imwrite(f"debug_frame_{frame_count}_no_face.jpg", frame)
+            out.write(frame)
+            continue
 
-        out.write(frame)
+        # Smooth points
+        points_b = kalman_smoother.update(raw_points_b)
         
-        # Show progress
-        cv2.imshow("Smoothed Face Swap", frame)
+        # Warp
+        warped_face = perform_morph(img_a, frame, points_a, points_b, triangle_indices)
+
+        # --- DIAGNOSTIC 2: Is the mask broken or empty? ---
+        gray_morphed = cv2.cvtColor(warped_face, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray_morphed, 1, 255, cv2.THRESH_BINARY)
+        
+        non_zero_pixels = cv2.countNonZero(mask)
+        if non_zero_pixels < 500: # Arbitrary low number indicating a failed warp/empty mask
+            print(f"Skipped Frame {frame_count}: Mask is nearly empty (Pixels: {non_zero_pixels}).")
+            cv2.imwrite(f"debug_frame_{frame_count}_bad_mask_original.jpg", frame)
+            cv2.imwrite(f"debug_frame_{frame_count}_bad_mask_warped.jpg", warped_face)
+            out.write(frame)
+            continue
+
+        # --- DIAGNOSTIC 3: Did Seamless Clone fail? ---
+        try:
+            cloned_frame = replace_face_seamless(frame, warped_face, points_b)
+            out.write(cloned_frame)
+            
+            cv2.imshow("Smoothed Face Swap", cloned_frame)
+        except Exception as e:
+            print(f"Skipped Frame {frame_count}: Seamless clone crashed. Error: {e}")
+            cv2.imwrite(f"debug_frame_{frame_count}_clone_crash.jpg", frame)
+            cv2.imwrite(f"debug_frame_{frame_count}_clone_crash_mask.jpg", mask)
+            out.write(frame) # Write original frame to keep video playing
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
