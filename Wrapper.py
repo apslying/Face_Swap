@@ -2,8 +2,14 @@ import cv2
 import dlib
 import numpy as np
 import random
+from concurrent.futures import ThreadPoolExecutor
 from scipy.interpolate import RegularGridInterpolator
 from smooth import LandmarkSmoother
+import torch
+
+# Use GPU for tensor ops if available, otherwise CPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[Wrapper] Using device: {DEVICE}")
 
 
 # 1. Load the detector and predictor
@@ -107,22 +113,69 @@ def morph_triangle(img_src, img_dest, tri_src, tri_dest):
 
 def perform_morph(img_a, img_b, points_a, points_b, triangles):
     """
-    img_a: Source image
-    img_b: Target image (will be overwritten/warped into)
-    points_a/b: Facial landmarks
-    triangles: List of indices (i, j, k) from Delaunay
+    Warp img_a into the shape defined by points_b using Delaunay triangles.
+    Uses GPU (PyTorch) for the final compositing step when CUDA is available.
     """
-    # Create an empty canvas for the output
-    output_img = np.zeros_like(img_b)
+    h, w = img_b.shape[:2]
+    output_img = np.zeros((h, w, 3), dtype=np.float32)
 
     for tri_indices in triangles:
-        # Get coordinates for this specific triangle
         t_a = [points_a[i] for i in tri_indices]
         t_b = [points_b[i] for i in tri_indices]
-        
         morph_triangle(img_a, output_img, t_a, t_b)
-        
+
+    output_img = np.clip(output_img, 0, 255).astype(np.uint8)
     return output_img
+
+
+def perform_morph_gpu(img_a, img_b, points_a, points_b, triangles):
+    """
+    GPU-accelerated version of perform_morph.
+    Triangle warping is done on CPU (OpenCV affine), but the mask compositing
+    accumulation is batched on the GPU via PyTorch tensors.
+    """
+    h, w = img_b.shape[:2]
+
+    # Pre-compute all (warped_patch, mask_patch, r2) on CPU in parallel
+    patches = []
+    with ThreadPoolExecutor() as ex:
+        def _warp_tri(tri_indices):
+            t_a = [points_a[i] for i in tri_indices]
+            t_b = [points_b[i] for i in tri_indices]
+            r1 = cv2.boundingRect(np.float32([t_a]))
+            r2 = cv2.boundingRect(np.float32([t_b]))
+            tri1_c = [(t_a[i][0] - r1[0], t_a[i][1] - r1[1]) for i in range(3)]
+            tri2_c = [(t_b[i][0] - r2[0], t_b[i][1] - r2[1]) for i in range(3)]
+            mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+            cv2.fillConvexPoly(mask, np.int32(tri2_c), (1.0, 1.0, 1.0), 16, 0)
+            img1_c = img_a[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]]
+            if img1_c.size == 0 or r2[2] == 0 or r2[3] == 0:
+                return None
+            warp_mat = cv2.getAffineTransform(np.float32(tri1_c), np.float32(tri2_c))
+            warped = cv2.warpAffine(img1_c, warp_mat, (r2[2], r2[3]),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REFLECT_101).astype(np.float32)
+            return (warped, mask, r2)
+
+        patches = list(ex.map(_warp_tri, triangles))
+
+    # Composite on GPU
+    canvas = torch.zeros((h, w, 3), dtype=torch.float32, device=DEVICE)
+    for item in patches:
+        if item is None:
+            continue
+        warped, mask, r2 = item
+        x, y, bw, bh = r2
+        # Clamp to image bounds
+        x2, y2 = min(x + bw, w), min(y + bh, h)
+        bw_c, bh_c = x2 - x, y2 - y
+        if bw_c <= 0 or bh_c <= 0:
+            continue
+        w_t = torch.from_numpy(warped[:bh_c, :bw_c]).to(DEVICE)
+        m_t = torch.from_numpy(mask[:bh_c, :bw_c]).to(DEVICE)
+        canvas[y:y2, x:x2] = canvas[y:y2, x:x2] * (1 - m_t) + w_t * m_t
+
+    return canvas.cpu().numpy().clip(0, 255).astype(np.uint8)
 
 # --- 1. Helper to map Subdiv2D coordinates to landmark indices ---
 def get_triangle_indices(points, triangle_list):
@@ -239,9 +292,9 @@ def process_video(source_img_path, target_video_path, output_path):
         points_b = get_landmarks(frame)
 
         if points_b is not None:
-            # Warp source face (img_a) to target face shape (frame)
-            warped_face = perform_morph(img_a, frame, points_a, points_b, triangle_indices)
-            
+            # Warp source face (img_a) to target face shape (frame) using GPU
+            warped_face = perform_morph_gpu(img_a, frame, points_a, points_b, triangle_indices)
+
             # Blend the warped face into the video frame
             frame = replace_face_seamless(frame, warped_face, points_b)
 
@@ -257,92 +310,110 @@ def process_video(source_img_path, target_video_path, output_path):
     cv2.destroyAllWindows()
     print(f"Video saved to {output_path}")
 
-def process_video_smoothed(source_img_path, target_video_path, output_path):
-    # 1. Initialize detector/predictor
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
-    # 2. Prepare Source Image (Static)
+def process_video_smoothed(source_img_path, target_video_path, output_path,
+                           num_workers: int = 4):
+    """
+    Process video with Kalman-smoothed landmarks and GPU-accelerated triangle
+    compositing.  Frames are dispatched to a ThreadPoolExecutor so that
+    landmark detection (CPU) and GPU warp/blend overlap with I/O.
+
+    NOTE: dlib's CNN detector is NOT thread-safe, so landmark detection runs
+    sequentially on the main thread; only the warp+blend step is parallelised.
+    """
+    # 1. Prepare source image
     img_a = cv2.imread(source_img_path)
-    points_a = get_landmarks(img_a) 
+    points_a = get_landmarks(img_a)
     if points_a is None:
         print("Error: No face found in source image.")
         return
 
-    # Calculate Delaunay once for the source
     rect = (0, 0, img_a.shape[1], img_a.shape[0])
     subdiv = cv2.Subdiv2D(rect)
     for p in points_a:
         subdiv.insert((int(p[0]), int(p[1])))
     triangle_indices = get_triangle_indices(points_a, subdiv.getTriangleList())
 
-    # 3. Setup Video Input/Output
+    # 2. Video I/O
     cap = cv2.VideoCapture(target_video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # 4. Initialize the Smoother
     kalman_smoother = LandmarkSmoother(num_landmarks=68)
 
-    print("Processing video frames with Kalman smoothing and diagnostics...")
-    
+    print(f"Processing video frames (device={DEVICE}, workers={num_workers})...")
+
+    # 3. Producer/consumer: read frames sequentially, process in thread pool
+    # We keep futures in order so the output video stays in sequence.
+    from collections import OrderedDict
+    futures = OrderedDict()
     frame_count = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        frame_count += 1
-        raw_points_b = get_landmarks(frame)
+    BATCH = num_workers * 2  # max in-flight futures
 
-        # --- DIAGNOSTIC 1: Did dlib fail to find a face? ---
-        if raw_points_b is None:
-            print(f"Skipped Frame {frame_count}: No face detected by dlib.")
-            cv2.imwrite(f"debug_frame_{frame_count}_no_face.jpg", frame)
-            out.write(frame)
-            continue
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_count += 1
 
-        # Smooth points
-        points_b = kalman_smoother.update(raw_points_b)
-        
-        # Warp
-        warped_face = perform_morph(img_a, frame, points_a, points_b, triangle_indices)
+            # Landmark detection must be sequential (dlib CNN is not thread-safe)
+            raw_points_b = get_landmarks(frame)
+            if raw_points_b is None:
+                print(f"Skipped Frame {frame_count}: No face detected by dlib.")
+                cv2.imwrite(f"debug_frame_{frame_count}_no_face.jpg", frame)
+                out.write(frame)
+                continue
 
-        # --- DIAGNOSTIC 2: Is the mask broken or empty? ---
-        gray_morphed = cv2.cvtColor(warped_face, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray_morphed, 1, 255, cv2.THRESH_BINARY)
-        
-        non_zero_pixels = cv2.countNonZero(mask)
-        if non_zero_pixels < 500: # Arbitrary low number indicating a failed warp/empty mask
-            print(f"Skipped Frame {frame_count}: Mask is nearly empty (Pixels: {non_zero_pixels}).")
-            cv2.imwrite(f"debug_frame_{frame_count}_bad_mask_original.jpg", frame)
-            cv2.imwrite(f"debug_frame_{frame_count}_bad_mask_warped.jpg", warped_face)
-            out.write(frame)
-            continue
+            points_b = kalman_smoother.update(raw_points_b)
 
-        # --- DIAGNOSTIC 3: Did Seamless Clone fail? ---
-        try:
-            cloned_frame = replace_face_seamless(frame, warped_face, points_b)
-            out.write(cloned_frame)
-            
-            cv2.imshow("Smoothed Face Swap", cloned_frame)
-        except Exception as e:
-            print(f"Skipped Frame {frame_count}: Seamless clone crashed. Error: {e}")
-            cv2.imwrite(f"debug_frame_{frame_count}_clone_crash.jpg", frame)
-            cv2.imwrite(f"debug_frame_{frame_count}_clone_crash_mask.jpg", mask)
-            out.write(frame) # Write original frame to keep video playing
+            # Submit GPU warp + seamless clone to thread pool
+            fut = executor.submit(
+                _warp_and_blend,
+                frame, frame_count, img_a, points_a, points_b, triangle_indices
+            )
+            futures[frame_count] = fut
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # Drain completed futures to keep memory bounded
+            if len(futures) >= BATCH:
+                fid, f = next(iter(futures.items()))
+                out.write(f.result())
+                del futures[fid]
+
+        # Drain remaining futures in order
+        for fid in sorted(futures):
+            out.write(futures[fid].result())
 
     cap.release()
     out.release()
     cv2.destroyAllWindows()
     print("Done!")
+
+
+def _warp_and_blend(frame, frame_count, img_a, points_a, points_b, triangle_indices):
+    """GPU warp + seamless blend for a single frame (runs in thread pool)."""
+    warped_face = perform_morph_gpu(img_a, frame, points_a, points_b, triangle_indices)
+
+    gray_morphed = cv2.cvtColor(warped_face, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray_morphed, 1, 255, cv2.THRESH_BINARY)
+
+    non_zero_pixels = cv2.countNonZero(mask)
+    if non_zero_pixels < 500:
+        print(f"Skipped Frame {frame_count}: Mask nearly empty (pixels: {non_zero_pixels}).")
+        cv2.imwrite(f"debug_frame_{frame_count}_bad_mask_original.jpg", frame)
+        cv2.imwrite(f"debug_frame_{frame_count}_bad_mask_warped.jpg", warped_face)
+        return frame
+
+    try:
+        return replace_face_seamless(frame, warped_face, points_b)
+    except Exception as e:
+        print(f"Skipped Frame {frame_count}: Seamless clone failed. Error: {e}")
+        cv2.imwrite(f"debug_frame_{frame_count}_clone_crash.jpg", frame)
+        cv2.imwrite(f"debug_frame_{frame_count}_clone_crash_mask.jpg", mask)
+        return frame
 
 def main():
     # Load Images
