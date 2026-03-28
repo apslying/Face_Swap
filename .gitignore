@@ -1,1 +1,6 @@
 /data
+/slurm
+*.txt
+*.sh
+*.pyc
+
