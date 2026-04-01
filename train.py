@@ -15,7 +15,12 @@ def make_trainable(gaussians):
 
     ### YOUR CODE HERE ###
     # HINT: You can access and modify parameters from gaussians
-    pass
+    attrs = ["means", "pre_act_scales", "colours", "pre_act_opacities"]
+    if not gaussians.is_isotropic:
+        attrs += ["pre_act_quats"]
+    for attr in attrs:
+        param = getattr(gaussians, attr)
+        param.requires_grad = True
 
 def setup_optimizer(gaussians):
 
@@ -28,14 +33,13 @@ def setup_optimizer(gaussians):
     # fast with the default settings.
     # HINT: Consider setting different learning rates for different sets of parameters.
     parameters = [
-        {'params': [gaussians.pre_act_opacities], 'lr': 0.05, "name": "opacities"},
-        {'params': [gaussians.pre_act_scales], 'lr': 0.05, "name": "scales"},
-        {'params': [gaussians.colours], 'lr': 0.05, "name": "colours"},
-        {'params': [gaussians.means], 'lr': 0.05, "name": "means"},
+        {'params': [gaussians.pre_act_opacities], 'lr': 5e-2, "name": "opacities"},
+        {'params': [gaussians.pre_act_scales], 'lr': 5e-3, "name": "scales"},
+        {'params': [gaussians.colours], 'lr': 2.5e-3, "name": "colours"},
+        {'params': [gaussians.means], 'lr': 1.6e-4, "name": "means"},
+        {'params': [gaussians.pre_act_quats], 'lr': 1e-3, "name": "quats"},
     ]
-    optimizer = torch.optim.Adam(parameters, lr=0.0, eps=1e-15)
-    optimizer = None
-
+    optimizer = torch.optim.Adam(parameters, lr=1e-3, eps=1e-15)
     return optimizer
 
 def run_training(args):
@@ -104,12 +108,12 @@ def run_training(args):
         # HINT: Get img_size from train_dataset
         # HINT: Get per_splat from args.gaussians_per_splat
         # HINT: camera is available above
-        pred_img = None
+        pred_img, _, _, _ = scene.render(camera, per_splat=args.gaussians_per_splat, img_size=train_dataset.img_size, bg_colour=(0.0, 0.0, 0.0))
 
         # Compute loss
         ### YOUR CODE HERE ###
         # HINT: A simple standard loss function should work.
-        loss = None
+        loss = torch.nn.functional.mse_loss(pred_img, gt_img)
 
         loss.backward()
         optimizer.step()
@@ -151,7 +155,7 @@ def run_training(args):
             # HINT: Get img_size from train_dataset
             # HINT: Get per_splat from args.gaussians_per_splat
             # HINT: camera is available above
-            pred_img = None
+            pred_img, _, _, _ = scene.render(camera, per_splat=args.gaussians_per_splat, img_size=train_dataset.img_size, bg_colour=(0.0, 0.0, 0.0)) # TODO: repeated code
 
         pred_npy = pred_img.detach().cpu().numpy()
         pred_npy = (np.clip(pred_npy, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -179,7 +183,7 @@ def run_training(args):
             # HINT: Get img_size from test_dataset
             # HINT: Get per_splat from args.gaussians_per_splat
             # HINT: camera is available above
-            pred_img = None
+            pred_img, _, _, _ = scene.render(camera, per_splat=args.gaussians_per_splat, img_size=test_dataset.img_size, bg_colour=(0.0, 0.0, 0.0)) # TODO: repeated code
 
             gt_npy = gt_img.detach().cpu().numpy()
             pred_npy = pred_img.detach().cpu().numpy()
