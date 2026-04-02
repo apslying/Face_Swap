@@ -237,6 +237,8 @@ class Gaussians:
         # Based on your answers, can you write a more efficient code for the isotropic case?
         from pytorch3d.transforms import quaternion_to_matrix
         R = quaternion_to_matrix(quats) # (N, 3, 3)
+        if self.is_isotropic:
+            scales = scales.repeat(1, 3)
         S = torch.diag_embed(scales) # (N, 3, 3)
         M = torch.bmm(R, S)
         cov_3D = torch.bmm(M, M.transpose(1, 2)) # (N, 3, 3)
@@ -278,11 +280,12 @@ class Gaussians:
         # HINT: For computing the jacobian J, can you find a function in this file that can help?
         J = self._compute_jacobian(means_3D, camera, img_size) 
         #pad J to (N, 2, 3) to (N, 3, 3) by appending a zero third row
-        J = torch.nn.functional.pad(J, (0, 0, 0, 0, 0, 1), mode='constant', value=0) #TODO: Verify shape
+        J = torch.nn.functional.pad(J, (0, 0, 0, 1), mode='constant', value=0) # (N, 3, 3)
         ### YOUR CODE HERE ###
         # HINT: Can you extract the world to camera rotation matrix (W) from one of the inputs
         # of this function?
-        W = camera.get_world_to_view_transform().rotation # (N, 3, 3)
+        W = camera.R # (1, 3, 3)
+        W = W.expand(len(means_3D), 3, 3) # (N, 3, 3)
 
         ### YOUR CODE HERE ###
         # HINT: Can you find a function in this file that can help?
@@ -368,7 +371,8 @@ class Gaussians:
         """
         ### YOUR CODE HERE ###
         # HINT: Refer to README for a relevant equation
-        power = -0.5 * (points_2D - means_2D).transpose(1, 2) @ cov_2D_inverse @ (points_2D - means_2D) # (N, H*W)
+        temp = -0.5 * (points_2D - means_2D) @ cov_2D_inverse
+        power = torch.linalg.vecdot(temp, (points_2D - means_2D), dim=-1)  # (N, H*W)
 
         return power
 
