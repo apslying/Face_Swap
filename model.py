@@ -480,7 +480,7 @@ class Scene:
 
         ### YOUR CODE HERE ###
         # HINT: Refer to README for a relevant equation.
-        alphas = opacities * torch.exp(power) # (N, H*W) TODO: check broadcasting
+        alphas = opacities.unsqueeze(1) * torch.exp(power) # (N, H*W) TODO: exp_power
         alphas = torch.reshape(alphas, (-1, H, W))  # (N, H, W)
 
         # Post processing for numerical stability
@@ -532,7 +532,7 @@ class Scene:
 
         ### YOUR CODE HERE ###
         # HINT: Refer to README for a relevant equation.
-        transmittance = torch.cumprod(one_minus_alphas, dim=0) # (N+1, H, W)
+        transmittance = torch.cumprod(one_minus_alphas, dim=0)[:-1, ...] # (N, H, W)
 
         # Post processing for numerical stability
         transmittance = torch.where(transmittance < 1e-4, 0.0, transmittance)  # (N, H, W)
