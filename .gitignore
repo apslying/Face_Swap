@@ -1,6 +1,6 @@
 /data
 /slurm
-/output
+/output*
 *.txt
 *.sh
 *.pyc
