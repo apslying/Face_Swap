@@ -413,7 +413,7 @@ class Scene:
         # HINT: You can use get the means of 3D Gaussians self.gaussians and calculate
         # the depth using the means and the camera
         means_3D = self.gaussians.means
-        z_vals = means_3D[:, 2] # (N,)
+        z_vals = camera.get_world_to_view_transform().transform_points(means_3D)[:, 2] # (N,)
         return z_vals
 
     def get_idxs_to_filter_and_sort(self, z_vals: torch.Tensor):
@@ -480,7 +480,7 @@ class Scene:
 
         ### YOUR CODE HERE ###
         # HINT: Refer to README for a relevant equation.
-        alphas = opacities.unsqueeze(1) * torch.exp(power) # (N, H*W) TODO: exp_power
+        alphas = opacities.unsqueeze(1) * exp_power # (N, H*W) 
         alphas = torch.reshape(alphas, (-1, H, W))  # (N, H, W)
 
         # Post processing for numerical stability
@@ -618,7 +618,7 @@ class Scene:
 
         ### YOUR CODE HERE ###
         # HINT: Can you implement an equation inspired by the equation for colour?
-        mask = torch.sum(alphas * transmittance, dim=0) # (H, W, 1) TODO: understand mask
+        mask = torch.sum(torch.ones(alphas.shape).cuda() * alphas * transmittance, dim=0) # (H, W, 1) TODO: understand mask
 
         final_transmittance = transmittance[-1, ..., 0].unsqueeze(0)  # (1, H, W)
         return image, depth, mask, final_transmittance
