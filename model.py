@@ -242,16 +242,18 @@ class Gaussians:
         S = torch.diag_embed(scales) # (N, 3, 3)
         M = torch.bmm(R, S)
         cov_3D = torch.bmm(M, M.transpose(1, 2)) # (N, 3, 3)
+
         # if self.is_isotropic:
+        # #     ### YOUR CODE HERE ###
+        #     s = scales * scales
+        #     cov_3D = s.unsqueeze(-1) * torch.bmm(R, R.transpose(1, 2))  # (N, 3, 3)
 
-        #     ### YOUR CODE HERE ###
-        #     cov_3D = None  # (N, 3, 3)
-
-        # # HINT: You can use a function from pytorch3d to convert quaternions to rotation matrices.
+        # # # HINT: You can use a function from pytorch3d to convert quaternions to rotation matrices.
         # else:
-
-        #     ### YOUR CODE HERE ###
-        #     cov_3D = None  # (N, 3, 3)
+        # #     ### YOUR CODE HERE ###
+        #     S = torch.diag_embed(scales) # (N, 3, 3)
+        #     M = torch.bmm(R, S)
+        #     cov_3D = torch.bmm(M, M.transpose(1, 2)) # (N, 3, 3)
 
         return cov_3D
 
