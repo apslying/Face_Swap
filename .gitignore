@@ -1,6 +1,14 @@
-*.jpg
 *.txt
 *.dat
-*.mp4
 *.pyc
 /TestSet_P2/
+*.log
+*.sh
+
+/*
+
+# 2. Allow the .gitignore file itself (so it remains tracked)
+!.gitignore
+
+# 3. Allow the /output directory and its contents
+!output/
